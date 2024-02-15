@@ -2,7 +2,7 @@
 
 FROM node:12-buster as wwwstage
 
-ARG KASMWEB_RELEASE="75d4f9c57c1a0e99f045270006376f75be44f609"
+ARG KASMWEB_RELEASE="54b9bac920267e902af3c9dfca4c0f64cff92f41"
 
 RUN \
   echo "**** build clientside ****" && \
@@ -332,7 +332,8 @@ RUN \
   ln -s /usr/local/lib/kasmvnc /usr/lib/kasmvncserver && \
   echo "**** openbox tweaks ****" && \
   sed -i \
-    's/NLIMC/NLMC/g' \
+    -e 's/NLIMC/NLMC/g' \
+    -e 's|</applications>|  <application class="*"><maximized>yes</maximized></application>\n</applications>|' \
     /etc/xdg/openbox/rc.xml && \
   echo "**** user perms ****" && \
   echo "abc:abc" | chpasswd && \
