@@ -17,6 +17,8 @@ pipeline {
     GITLAB_TOKEN=credentials('b6f0f1dd-6952-4cf6-95d1-9c06380283f0')
     GITLAB_NAMESPACE=credentials('gitlab-namespace-id')
     DOCKERHUB_TOKEN=credentials('docker-hub-ci-pat')
+    QUAYIO_API_TOKEN=credentials('quayio-repo-api-token')
+    GIT_SIGNING_KEY=credentials('484fbca6-9a4f-455e-b9e3-97ac98785f5f')
     BUILD_VERSION_ARG = 'KASMVNC_RELEASE'
     LS_USER = 'linuxserver'
     LS_REPO = 'docker-baseimage-kasmvnc'
@@ -36,9 +38,23 @@ pipeline {
     CI_WEBPATH=''
   }
   stages {
+    stage("Set git config"){
+      steps{
+        sh '''#!/bin/bash
+              cat ${GIT_SIGNING_KEY} > /config/.ssh/id_sign
+              chmod 600 /config/.ssh/id_sign
+              ssh-keygen -y -f /config/.ssh/id_sign > /config/.ssh/id_sign.pub
+              echo "Using $(ssh-keygen -lf /config/.ssh/id_sign) to sign commits"
+              git config --global gpg.format ssh
+              git config --global user.signingkey /config/.ssh/id_sign
+              git config --global commit.gpgsign true
+        '''
+      }
+    }
     // Setup all the basic environment variables needed for the build
     stage("Set ENV Variables base"){
       steps{
+        echo "Running on node: ${NODE_NAME}"
         sh '''#! /bin/bash
               containers=$(docker ps -aq)
               if [[ -n "${containers}" ]]; then
@@ -65,7 +81,7 @@ pipeline {
           env.CODE_URL = 'https://github.com/' + env.LS_USER + '/' + env.LS_REPO + '/commit/' + env.GIT_COMMIT
           env.DOCKERHUB_LINK = 'https://hub.docker.com/r/' + env.DOCKERHUB_IMAGE + '/tags/'
           env.PULL_REQUEST = env.CHANGE_ID
-          env.TEMPLATED_FILES = 'Jenkinsfile README.md LICENSE .editorconfig ./.github/CONTRIBUTING.md ./.github/FUNDING.yml ./.github/ISSUE_TEMPLATE/config.yml ./.github/ISSUE_TEMPLATE/issue.bug.yml ./.github/ISSUE_TEMPLATE/issue.feature.yml ./.github/PULL_REQUEST_TEMPLATE.md ./.github/workflows/external_trigger_scheduler.yml ./.github/workflows/greetings.yml ./.github/workflows/package_trigger_scheduler.yml ./.github/workflows/call_issue_pr_tracker.yml ./.github/workflows/call_issues_cron.yml ./.github/workflows/permissions.yml ./.github/workflows/external_trigger.yml ./.github/workflows/package_trigger.yml'
+          env.TEMPLATED_FILES = 'Jenkinsfile README.md LICENSE .editorconfig ./.github/CONTRIBUTING.md ./.github/FUNDING.yml ./.github/ISSUE_TEMPLATE/config.yml ./.github/ISSUE_TEMPLATE/issue.bug.yml ./.github/ISSUE_TEMPLATE/issue.feature.yml ./.github/PULL_REQUEST_TEMPLATE.md ./.github/workflows/external_trigger_scheduler.yml ./.github/workflows/greetings.yml ./.github/workflows/package_trigger_scheduler.yml ./.github/workflows/call_issue_pr_tracker.yml ./.github/workflows/call_issues_cron.yml ./.github/workflows/permissions.yml ./.github/workflows/external_trigger.yml'
         }
         sh '''#! /bin/bash
               echo "The default github branch detected as ${GH_DEFAULT_BRANCH}" '''
@@ -293,7 +309,7 @@ pipeline {
                 echo "Jenkinsfile is up to date."
               fi
               echo "Starting Stage 2 - Delete old templates"
-              OLD_TEMPLATES=".github/ISSUE_TEMPLATE.md .github/ISSUE_TEMPLATE/issue.bug.md .github/ISSUE_TEMPLATE/issue.feature.md .github/workflows/call_invalid_helper.yml .github/workflows/stale.yml"
+              OLD_TEMPLATES=".github/ISSUE_TEMPLATE.md .github/ISSUE_TEMPLATE/issue.bug.md .github/ISSUE_TEMPLATE/issue.feature.md .github/workflows/call_invalid_helper.yml .github/workflows/stale.yml .github/workflows/package_trigger.yml"
               for i in ${OLD_TEMPLATES}; do
                 if [[ -f "${i}" ]]; then
                   TEMPLATES_TO_DELETE="${i} ${TEMPLATES_TO_DELETE}"
@@ -440,10 +456,10 @@ pipeline {
       }
     }
     /* #######################
-           GitLab Mirroring
+       GitLab Mirroring and Quay.io Repo Visibility
        ####################### */
-    // Ping into Gitlab to mirror this repo and have a registry endpoint
-    stage("GitLab Mirror"){
+    // Ping into Gitlab to mirror this repo and have a registry endpoint & mark this repo on Quay.io as public
+    stage("GitLab Mirror and Quay.io Visibility"){
       when {
         environment name: 'EXIT_STATUS', value: ''
       }
@@ -459,6 +475,8 @@ pipeline {
             "visibility":"public"}' '''
         sh '''curl -H "Private-Token: ${GITLAB_TOKEN}" -X PUT "https://gitlab.com/api/v4/projects/Linuxserver.io%2F${LS_REPO}" \
           -d "mirror=true&import_url=https://github.com/linuxserver/${LS_REPO}.git" '''
+        sh '''curl -H "Content-Type: application/json" -H "Authorization: Bearer ${QUAYIO_API_TOKEN}" -X POST "https://quay.io/api/v1/repository${QUAYIMAGE/quay.io/}/changevisibility" \
+          -d '{"visibility":"public"}' ||: '''
       } 
     }
     /* ###############
@@ -550,7 +568,7 @@ pipeline {
               --provenance=false --sbom=false \
               --build-arg ${BUILD_VERSION_ARG}=${EXT_RELEASE} --build-arg VERSION=\"${VERSION_TAG}\" --build-arg BUILD_DATE=${GITHUB_DATE} ."
             sh "docker tag ${IMAGE}:arm64v8-${META_TAG} ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER}"
-            retry(5) {
+            retry_backoff(5,5) {
               sh "docker push ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER}"
             }
             sh '''#! /bin/bash
@@ -662,6 +680,14 @@ pipeline {
           }
           sh '''#! /bin/bash
                 set -e
+                if grep -q 'docker-baseimage' <<< "${LS_REPO}"; then
+                  echo "Detected baseimage, setting LSIO_FIRST_PARTY=true"
+                  if [ -n "${CI_DOCKERENV}" ]; then
+                    CI_DOCKERENV="LSIO_FIRST_PARTY=true|${CI_DOCKERENV}"
+                  else
+                    CI_DOCKERENV="LSIO_FIRST_PARTY=true"
+                  fi
+                fi
                 docker pull ghcr.io/linuxserver/ci:latest
                 if [ "${MULTIARCH}" == "true" ]; then
                   docker pull ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} --platform=arm64
@@ -674,15 +700,17 @@ pipeline {
                 -e DOCKER_LOGS_TIMEOUT=\"${CI_DELAY}\" \
                 -e TAGS=\"${CI_TAGS}\" \
                 -e META_TAG=\"${META_TAG}\" \
+                -e RELEASE_TAG=\"alpine320\" \
                 -e PORT=\"${CI_PORT}\" \
                 -e SSL=\"${CI_SSL}\" \
                 -e BASE=\"${DIST_IMAGE}\" \
                 -e SECRET_KEY=\"${S3_SECRET}\" \
                 -e ACCESS_KEY=\"${S3_KEY}\" \
-                -e DOCKER_ENV=\"LSIO_FIRST_PARTY=true|${CI_DOCKERENV}\" \
+                -e DOCKER_ENV=\"${CI_DOCKERENV}\" \
                 -e WEB_SCREENSHOT=\"${CI_WEB}\" \
                 -e WEB_AUTH=\"${CI_AUTH}\" \
                 -e WEB_PATH=\"${CI_WEBPATH}\" \
+                -e NODE_NAME=\"${NODE_NAME}\" \
                 -t ghcr.io/linuxserver/ci:latest \
                 python3 test_build.py'''
         }
@@ -706,7 +734,7 @@ pipeline {
             passwordVariable: 'QUAYPASS'
           ]
         ]) {
-          retry(5) {
+          retry_backoff(5,5) {
             sh '''#! /bin/bash
                   set -e
                   echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
@@ -724,7 +752,7 @@ pipeline {
                     docker push ${PUSHIMAGE}:${META_TAG}
                     docker push ${PUSHIMAGE}:${EXT_RELEASE_TAG}
                     if [ -n "${SEMVER}" ]; then
-                     docker push ${PUSHIMAGE}:${SEMVER}
+                      docker push ${PUSHIMAGE}:${SEMVER}
                     fi
                   done
                '''
@@ -747,7 +775,7 @@ pipeline {
             passwordVariable: 'QUAYPASS'
           ]
         ]) {
-          retry(5) {
+          retry_backoff(5,5) {
             sh '''#! /bin/bash
                   set -e
                   echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
@@ -810,7 +838,7 @@ pipeline {
              "object": "'${COMMIT_SHA}'",\
              "message": "Tagging Release '${EXT_RELEASE_CLEAN}'-ls'${LS_TAG_NUMBER}' to master",\
              "type": "commit",\
-             "tagger": {"name": "LinuxServer Jenkins","email": "jenkins@linuxserver.io","date": "'${GITHUB_DATE}'"}}' '''
+             "tagger": {"name": "LinuxServer-CI","email": "ci@linuxserver.io","date": "'${GITHUB_DATE}'"}}' '''
         echo "Pushing New release for Tag"
         sh '''#! /bin/bash
               echo "Updating base packages to ${PACKAGE_TAG}" > releasebody.json
@@ -942,18 +970,53 @@ EOF
      ###################### */
   post {
     always {
+      sh '''#!/bin/bash
+            rm -rf /config/.ssh/id_sign
+            rm -rf /config/.ssh/id_sign.pub
+            git config --global --unset gpg.format
+            git config --global --unset user.signingkey
+            git config --global --unset commit.gpgsign
+        '''
       script{
+        env.JOB_DATE = sh(
+            script: '''date '+%Y-%m-%dT%H:%M:%S%:z' ''',
+            returnStdout: true).trim()
         if (env.EXIT_STATUS == "ABORTED"){
           sh 'echo "build aborted"'
-        }
-        else if (currentBuild.currentResult == "SUCCESS"){
-          sh ''' curl -X POST -H "Content-Type: application/json" --data '{"avatar_url": "https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/jenkins-avatar.png","embeds": [{"color": 1681177,\
-                 "description": "**Build:**  '${BUILD_NUMBER}'\\n**CI Results:**  '${CI_URL}'\\n**ShellCheck Results:**  '${SHELLCHECK_URL}'\\n**Status:**  Success\\n**Job:** '${RUN_DISPLAY_URL}'\\n**Change:** '${CODE_URL}'\\n**External Release:**: '${RELEASE_LINK}'\\n**DockerHub:** '${DOCKERHUB_LINK}'\\n"}],\
-                 "username": "Jenkins"}' ${BUILDS_DISCORD} '''
-        }
-        else {
-          sh ''' curl -X POST -H "Content-Type: application/json" --data '{"avatar_url": "https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/jenkins-avatar.png","embeds": [{"color": 16711680,\
-                 "description": "**Build:**  '${BUILD_NUMBER}'\\n**CI Results:**  '${CI_URL}'\\n**ShellCheck Results:**  '${SHELLCHECK_URL}'\\n**Status:**  failure\\n**Job:** '${RUN_DISPLAY_URL}'\\n**Change:** '${CODE_URL}'\\n**External Release:**: '${RELEASE_LINK}'\\n**DockerHub:** '${DOCKERHUB_LINK}'\\n"}],\
+        }else{
+          if (currentBuild.currentResult == "SUCCESS"){
+            if (env.GITHUBIMAGE =~ /lspipepr/){
+              env.JOB_WEBHOOK_STATUS='Success'
+              env.JOB_WEBHOOK_COLOUR=3957028
+              env.JOB_WEBHOOK_FOOTER='PR Build'
+            }else if (env.GITHUBIMAGE =~ /lsiodev/){
+              env.JOB_WEBHOOK_STATUS='Success'
+              env.JOB_WEBHOOK_COLOUR=3957028
+              env.JOB_WEBHOOK_FOOTER='Dev Build'
+            }else{
+              env.JOB_WEBHOOK_STATUS='Success'
+              env.JOB_WEBHOOK_COLOUR=1681177
+              env.JOB_WEBHOOK_FOOTER='Live Build'
+            }
+          }else{
+            if (env.GITHUBIMAGE =~ /lspipepr/){
+              env.JOB_WEBHOOK_STATUS='Failure'
+              env.JOB_WEBHOOK_COLOUR=12669523
+              env.JOB_WEBHOOK_FOOTER='PR Build'
+            }else if (env.GITHUBIMAGE =~ /lsiodev/){
+              env.JOB_WEBHOOK_STATUS='Failure'
+              env.JOB_WEBHOOK_COLOUR=12669523
+              env.JOB_WEBHOOK_FOOTER='Dev Build'
+            }else{
+              env.JOB_WEBHOOK_STATUS='Failure'
+              env.JOB_WEBHOOK_COLOUR=16711680
+              env.JOB_WEBHOOK_FOOTER='Live Build'
+            }
+          }
+          sh ''' curl -X POST -H "Content-Type: application/json" --data '{"avatar_url": "https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/jenkins-avatar.png","embeds": [{"'color'": '${JOB_WEBHOOK_COLOUR}',\
+                 "footer": {"text" : "'"${JOB_WEBHOOK_FOOTER}"'"},\
+                 "timestamp": "'${JOB_DATE}'",\
+                 "description": "**Build:**  '${BUILD_NUMBER}'\\n**CI Results:**  '${CI_URL}'\\n**ShellCheck Results:**  '${SHELLCHECK_URL}'\\n**Status:**  '${JOB_WEBHOOK_STATUS}'\\n**Job:** '${RUN_DISPLAY_URL}'\\n**Change:** '${CODE_URL}'\\n**External Release:**: '${RELEASE_LINK}'\\n**DockerHub:** '${DOCKERHUB_LINK}'\\n"}],\
                  "username": "Jenkins"}' ${BUILDS_DISCORD} '''
         }
       }
@@ -970,4 +1033,21 @@ EOF
       cleanWs()
     }
   }
+}
+
+def retry_backoff(int max_attempts, int power_base, Closure c) {
+  int n = 0
+  while (n < max_attempts) {
+    try {
+      c()
+      return
+    } catch (err) {
+      if ((n + 1) >= max_attempts) {
+        throw err
+      }
+      sleep(power_base ** n)
+      n++
+    }
+  }
+  return
 }
